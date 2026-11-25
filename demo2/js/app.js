@@ -4,9 +4,9 @@ const SAM_IMG_SIZE = 1024;
 const PIXEL_MEAN = [123.675, 116.28, 103.53];
 const PIXEL_STD = [58.395, 57.12, 57.375];
 
-const ENCODER_URL = new URL('../mobile_sam_encoder_fp16.onnx', import.meta.url).href;
+const ENCODER_URL = new URL('../mobile_sam_encoder_fp16.onnx?v=4', import.meta.url).href;
 const DECODER_FILENAME = 'mobile_sam_decoder_fp16.onnx';
-const DECODER_URL = new URL('../mobile_sam_decoder_fp16.onnx', import.meta.url).href;
+const DECODER_URL = new URL('../mobile_sam_decoder_fp16.onnx?v=4', import.meta.url).href;
 
 // DOM elements
 const statusDot = document.getElementById('statusDot');
@@ -56,6 +56,7 @@ let pendingDecode = false;
 
 let currentEmbedding = null; // Float32Array (1 * 256 * 64 * 64)
 let frameInfo = null; // { width, height, samScale }
+let loggedFirstRun = false;
 
 let pinnedPoints = [];
 let hoverPoint = null;
@@ -304,6 +305,14 @@ async function runEncode(frame) {
     if (hasNonFinite(emb)) {
       throw new Error(`Encoder produced NaN/Inf on ${model.backend}`);
     }
+    if (!loggedFirstRun) {
+      let emin = Infinity, emax = -Infinity;
+      for (let i = 0; i < emb.length; i += 64) {
+        if (emb[i] < emin) emin = emb[i];
+        if (emb[i] > emax) emax = emb[i];
+      }
+      console.log(`[SAM] First encode (${model.backend}): min=${emin.toFixed(3)}, max=${emax.toFixed(3)}, size=${origW}x${origH}`);
+    }
     currentEmbedding = emb;
     frameInfo = { width: origW, height: origH, samScale };
     encodeBackoff.reset();
@@ -423,6 +432,16 @@ async function runDecode() {
     }
 
     const fgPixels = renderMask(maskTensor.data, maskTensor.dims[3], maskTensor.dims[2]);
+    if (!loggedFirstRun) {
+      loggedFirstRun = true;
+      let lmin = Infinity, lmax = -Infinity;
+      const d = maskTensor.data;
+      for (let i = 0; i < d.length; i += 64) {
+        if (d[i] < lmin) lmin = d[i];
+        if (d[i] > lmax) lmax = d[i];
+      }
+      console.log(`[SAM] First decode (${model.backend}): logits=[${lmin.toFixed(2)}, ${lmax.toFixed(2)}], fgPixels=${fgPixels}, iou=${iouTensor?.data?.[0]}`);
+    }
     drawOverlay();
 
     const fps = decodeMs > 0 ? (1000 / decodeMs).toFixed(1) : '—';

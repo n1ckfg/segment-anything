@@ -80,7 +80,7 @@ async function hasWebGPU() {
 function fetchModelBytes(url, onProgress) {
   if (!byteCache.has(url)) {
     const p = (async () => {
-      const response = await fetch(url);
+      const response = await fetch(url, { cache: 'no-cache' });
       if (!response.ok) {
         throw new Error(`${response.status} ${response.statusText} for ${url}`);
       }
