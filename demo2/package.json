@@ -1,0 +1,9 @@
+{
+  "name": "sam-webcam-demo2",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Realtime webcam segmentation demo for SAM ONNX models (FP32, FP16, QUInt8)",
+  "dependencies": {
+    "onnxruntime-web": "^1.21.0"
+  }
+}

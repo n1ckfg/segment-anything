@@ -10,6 +10,7 @@ from segment_anything import sam_model_registry
 from segment_anything.utils.onnx import SamOnnxModel
 
 import argparse
+import inspect
 import warnings
 
 try:
@@ -145,10 +146,7 @@ def run_export(
         warnings.filterwarnings("ignore", category=UserWarning)
         with open(output, "wb") as f:
             print(f"Exporting onnx model to {output}...")
-            torch.onnx.export(
-                onnx_model,
-                tuple(dummy_inputs.values()),
-                f,
+            export_kwargs = dict(
                 export_params=True,
                 verbose=False,
                 opset_version=opset,
@@ -156,6 +154,14 @@ def run_export(
                 input_names=list(dummy_inputs.keys()),
                 output_names=output_names,
                 dynamic_axes=dynamic_axes,
+            )
+            if "dynamo" in inspect.signature(torch.onnx.export).parameters:
+                export_kwargs["dynamo"] = False
+            torch.onnx.export(
+                onnx_model,
+                tuple(dummy_inputs.values()),
+                f,
+                **export_kwargs,
             )
 
     if onnxruntime_exists:
@@ -190,12 +196,14 @@ if __name__ == "__main__":
         from onnxruntime.quantization.quantize import quantize_dynamic  # type: ignore
 
         print(f"Quantizing model and writing to {args.quantize_out}...")
-        quantize_dynamic(
+        quantize_kwargs = dict(
             model_input=args.output,
             model_output=args.quantize_out,
-            optimize_model=True,
             per_channel=False,
             reduce_range=False,
             weight_type=QuantType.QUInt8,
         )
+        if "optimize_model" in inspect.signature(quantize_dynamic).parameters:
+            quantize_kwargs["optimize_model"] = True
+        quantize_dynamic(**quantize_kwargs)
         print("Done!")
