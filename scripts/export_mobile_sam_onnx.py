@@ -13,6 +13,7 @@ import warnings
 import onnx
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from mobile_sam import sam_model_registry
 from mobile_sam.utils.onnx import SamOnnxModel
 from onnxruntime.transformers import float16 as ort_fp16
@@ -20,12 +21,66 @@ from onnxruntime.transformers.onnx_model import OnnxModel
 
 
 class MobileSamEncoderOnnx(nn.Module):
+    """
+    Dynamic-resolution wrapper for MobileSAM's TinyViT-5M image encoder.
+    Accepts any (1, 3, H, W) tensor where H and W are multiples of 16 (e.g. 384, 512,
+    640, 768, 1024) and always outputs (1, 256, 64, 64) embeddings for SAM's decoder.
+    """
+
     def __init__(self, image_encoder: nn.Module) -> None:
         super().__init__()
         self.image_encoder = image_encoder
 
     def forward(self, input_image: torch.Tensor) -> torch.Tensor:
-        return self.image_encoder(input_image)
+        enc = self.image_encoder
+        x = enc.patch_embed(input_image)  # (B, C, H/4, W/4)
+
+        # Stage 0: MBConv blocks + PatchMerging (kept in 4D NCHW)
+        l0 = enc.layers[0]
+        for blk in l0.blocks:
+            x = blk(x)
+        pm0 = l0.downsample
+        x = pm0.conv3(pm0.act(pm0.conv2(pm0.act(pm0.conv1(x)))))  # (B, C, H/8, W/8)
+
+        # Stages 1..3: TinyViTBlock (local windowed attention) + optional PatchMerging
+        for layer in enc.layers[1:]:
+            B, C, H, W = x.shape
+            x_seq = x.flatten(2).transpose(1, 2)  # (B, H*W, C)
+            for blk in layer.blocks:
+                ws = blk.window_size
+                res_x = x_seq
+                x4 = x_seq.view(B, H, W, C)
+                pad_b = (ws - (H % ws)) % ws
+                pad_r = (ws - (W % ws)) % ws
+                x4 = F.pad(x4, (0, 0, 0, pad_r, 0, pad_b))
+                pH = H + pad_b
+                pW = W + pad_r
+                nH = pH // ws
+                nW = pW // ws
+                x4 = (
+                    x4.view(B, nH, ws, nW, ws, C)
+                    .transpose(2, 3)
+                    .reshape(B * nH * nW, ws * ws, C)
+                )
+                x4 = blk.attn(x4)
+                x4 = (
+                    x4.view(B, nH, nW, ws, ws, C)
+                    .transpose(2, 3)
+                    .reshape(B, pH, pW, C)
+                )
+                x4 = x4[:, :H, :W, :].contiguous()
+                x_seq = res_x + x4.view(B, H * W, C)
+                x_conv = blk.local_conv(x_seq.transpose(1, 2).reshape(B, C, H, W))
+                x_seq = x_conv.flatten(2).transpose(1, 2)
+                x_seq = x_seq + blk.mlp(x_seq)
+            x = x_seq.transpose(1, 2).reshape(B, C, H, W)
+            if layer.downsample is not None:
+                pm = layer.downsample
+                x = pm.conv3(pm.act(pm.conv2(pm.act(pm.conv1(x)))))
+
+        x = enc.neck(x)
+        x = F.interpolate(x, size=(64, 64), mode="bilinear", align_corners=False)
+        return x
 
 
 class FusedLayerNorm2d(nn.Module):
@@ -119,12 +174,14 @@ def main() -> None:
     dec_out = os.path.join(args.out_dir, "mobile_sam_decoder_fp16.onnx")
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        # 1. Export TinyViT-5M Image Encoder
+        # 1. Export dynamic-resolution TinyViT-5M Image Encoder
         enc_fp32 = os.path.join(tmpdir, "mobile_sam_encoder_fp32.onnx")
         encoder = MobileSamEncoderOnnx(sam.image_encoder)
-        dummy_img = torch.randn(1, 3, 1024, 1024, dtype=torch.float32)
+        # Use 640x640 dummy (where 640/8=80 and 640/16=40 are not multiples of 7 or 14)
+        # so TorchScript traces the non-zero pad and slice branches dynamically.
+        dummy_img = torch.randn(1, 3, 640, 640, dtype=torch.float32)
 
-        print("Exporting MobileSAM encoder...")
+        print("Exporting dynamic-resolution MobileSAM encoder...")
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=torch.jit.TracerWarning)
             warnings.filterwarnings("ignore", category=UserWarning)
@@ -135,6 +192,7 @@ def main() -> None:
                     enc_fp32,
                     input_names=["input_image"],
                     output_names=["image_embeddings"],
+                    dynamic_axes={"input_image": {2: "height", 3: "width"}},
                     **base_export_kwargs,
                 )
         convert_to_fp16(enc_fp32, enc_out, fp32_node_prefixes=("neck/neck.1/", "neck/neck.3/"))

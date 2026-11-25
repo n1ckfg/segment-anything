@@ -19,6 +19,19 @@
           <h1>SAM Realtime Webcam</h1>
           <span class="badge" id="statusBadge">Initializing…</span>
         </div>
+
+        <div class="model-controls">
+          <label class="control-group" for="resSelect">
+            <span>Resolution</span>
+            <select id="resSelect">
+              <option value="384">384 px (Fastest)</option>
+              <option value="512">512 px (Fast)</option>
+              <option value="640" selected>640 px (Balanced)</option>
+              <option value="768">768 px (High)</option>
+              <option value="1024">1024 px (Native SAM)</option>
+            </select>
+          </label>
+        </div>
       </header>
 
       <main class="stage-wrapper">

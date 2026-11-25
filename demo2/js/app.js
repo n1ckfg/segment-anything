@@ -1,16 +1,17 @@
 import { loadOnnxModel, Backoff } from './OnnxModel.js';
 
-const SAM_IMG_SIZE = 1024;
+const SAM_DECODER_SIZE = 1024;
 const PIXEL_MEAN = [123.675, 116.28, 103.53];
 const PIXEL_STD = [58.395, 57.12, 57.375];
 
-const ENCODER_URL = new URL('../mobile_sam_encoder_fp16.onnx?v=4', import.meta.url).href;
+const ENCODER_URL = new URL('../mobile_sam_encoder_fp16.onnx?v=5', import.meta.url).href;
 const DECODER_FILENAME = 'mobile_sam_decoder_fp16.onnx';
-const DECODER_URL = new URL('../mobile_sam_decoder_fp16.onnx?v=4', import.meta.url).href;
+const DECODER_URL = new URL('../mobile_sam_decoder_fp16.onnx?v=5', import.meta.url).href;
 
 // DOM elements
 const statusDot = document.getElementById('statusDot');
 const statusBadge = document.getElementById('statusBadge');
+const resSelect = document.getElementById('resSelect');
 const stage = document.getElementById('stage');
 const video = document.getElementById('webcam');
 const frozenCanvas = document.getElementById('frozenCanvas');
@@ -72,13 +73,17 @@ function formatMB(bytes) {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-function getPreprocessShape(oldH, oldW, longSide = SAM_IMG_SIZE) {
+function getPreprocessShape(oldH, oldW, longSide) {
   const scale = longSide / Math.max(oldH, oldW);
   return {
     newH: Math.floor(oldH * scale + 0.5),
     newW: Math.floor(oldW * scale + 0.5),
     scale,
   };
+}
+
+function getSelectedEncSize() {
+  return parseInt(resSelect.value, 10) || 640;
 }
 
 function syncCanvasSizes(w, h) {
@@ -241,14 +246,15 @@ function grabCurrentFrame(freezeFrame) {
     frozenCanvas.classList.add('hidden');
   }
 
-  const { newH, newW, scale } = getPreprocessShape(vh, vw, SAM_IMG_SIZE);
+  const encSize = getSelectedEncSize();
+  const { newH, newW } = getPreprocessShape(vh, vw, encSize);
   if (preprocessCanvas.width !== newW || preprocessCanvas.height !== newH) {
     preprocessCanvas.width = newW;
     preprocessCanvas.height = newH;
   }
   preprocessCtx.drawImage(video, 0, 0, newW, newH);
   const rgba = preprocessCtx.getImageData(0, 0, newW, newH).data;
-  return { rgba, newW, newH, origW: vw, origH: vh, samScale: scale };
+  return { rgba, newW, newH, encSize, origW: vw, origH: vh };
 }
 
 function queueWebcamFrame(freezeFrame) {
@@ -277,9 +283,9 @@ function hasNonFinite(arr) {
 async function runEncode(frame) {
   encodeRunning = true;
   const model = encoderModel;
-  const { rgba, newW, newH, origW, origH, samScale } = frame;
+  const { rgba, newW, newH, encSize } = frame;
 
-  const plane = SAM_IMG_SIZE * SAM_IMG_SIZE;
+  const plane = encSize * encSize;
   const data = new Float32Array(3 * plane);
   const invStd0 = 1 / PIXEL_STD[0];
   const invStd1 = 1 / PIXEL_STD[1];
@@ -287,7 +293,7 @@ async function runEncode(frame) {
 
   for (let y = 0; y < newH; y++) {
     const srcRow = y * newW * 4;
-    const dstRow = y * SAM_IMG_SIZE;
+    const dstRow = y * encSize;
     for (let x = 0; x < newW; x++) {
       const s = srcRow + x * 4;
       const d = dstRow + x;
@@ -299,7 +305,7 @@ async function runEncode(frame) {
 
   const t0 = performance.now();
   try {
-    const inputTensor = new model.ort.Tensor('float32', data, [1, 3, SAM_IMG_SIZE, SAM_IMG_SIZE]);
+    const inputTensor = new model.ort.Tensor('float32', data, [1, 3, encSize, encSize]);
     const out = await model.run({ input_image: inputTensor }, { priority: 0 });
     const emb = new Float32Array(out.image_embeddings.data);
     if (hasNonFinite(emb)) {
@@ -311,16 +317,17 @@ async function runEncode(frame) {
         if (emb[i] < emin) emin = emb[i];
         if (emb[i] > emax) emax = emb[i];
       }
-      console.log(`[SAM] First encode (${model.backend}): min=${emin.toFixed(3)}, max=${emax.toFixed(3)}, size=${origW}x${origH}`);
+      console.log(`[SAM] First encode (${model.backend}, ${encSize}px): min=${emin.toFixed(3)}, max=${emax.toFixed(3)}, mask=${newW}x${newH}`);
     }
     currentEmbedding = emb;
-    frameInfo = { width: origW, height: origH, samScale };
+    // Decoder operates in 1024 frame; output mask at (newH, newW) for fast readback & draw
+    frameInfo = { maskW: newW, maskH: newH, encSize };
     encodeBackoff.reset();
 
     const encodeMs = performance.now() - t0;
     const fps = encodeMs > 0 ? (1000 / encodeMs).toFixed(1) : '—';
-    metricEncode.textContent = `${encodeMs.toFixed(0)} ms (${fps} FPS, ${model.backend})`;
-    setStatus('ready', 'Live • Hover or click video to segment');
+    metricEncode.textContent = `${encodeMs.toFixed(0)} ms (${fps} FPS, ${encSize}px)`;
+    setStatus('ready', `Live (${newW}×${newH}) • Hover or click video to segment`);
     scheduleDecode();
   } catch (err) {
     console.error(`Encoder run failed on ${model.backend}:`, err);
@@ -398,9 +405,10 @@ async function runDecode() {
     const coords = new Float32Array(2 * (n + 1));
     const labels = new Float32Array(n + 1);
 
+    const coordScale = SAM_DECODER_SIZE / frameInfo.encSize;
     for (let i = 0; i < n; i++) {
-      coords[2 * i] = pts[i].x * frameInfo.width * frameInfo.samScale;
-      coords[2 * i + 1] = pts[i].y * frameInfo.height * frameInfo.samScale;
+      coords[2 * i] = pts[i].x * frameInfo.maskW * coordScale;
+      coords[2 * i + 1] = pts[i].y * frameInfo.maskH * coordScale;
       labels[i] = pts[i].label;
     }
     coords[2 * n] = 0.0;
@@ -413,7 +421,7 @@ async function runDecode() {
       point_labels: new ort.Tensor('float32', labels, [1, n + 1]),
       mask_input: new ort.Tensor('float32', new Float32Array(256 * 256), [1, 1, 256, 256]),
       has_mask_input: new ort.Tensor('float32', new Float32Array([0]), [1]),
-      orig_im_size: new ort.Tensor('float32', new Float32Array([frameInfo.height, frameInfo.width]), [2]),
+      orig_im_size: new ort.Tensor('float32', new Float32Array([frameInfo.maskH, frameInfo.maskW]), [2]),
     };
 
     const t0 = performance.now();
@@ -556,6 +564,12 @@ function syncMirror() {
 
 // ---- Event Listeners ----
 
+resSelect.addEventListener('change', () => {
+  pendingEncode = null;
+  if (stream && encoderModel) {
+    queueWebcamFrame(!liveMode);
+  }
+});
 mirrorToggle.addEventListener('change', syncMirror);
 opacitySlider.addEventListener('input', scheduleDecode);
 
